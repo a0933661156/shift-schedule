@@ -2,39 +2,33 @@ import { createWorker, PSM } from "tesseract.js";
 import type { Worker } from "tesseract.js";
 import { daysInMonth } from "./calendar.ts";
 import { extractRow, type OcrWord } from "./row.ts";
-import type { MonthSchedule } from "../types.ts";
+import { coerceShift } from "./shifts.ts";
+import type { DayShift, MonthSchedule } from "../types.ts";
 
-const OCR_ENDPOINT = "https://api.ocr.space/parse/image";
-const OCR_KEY = "helloworld";
-const MAX_BYTES = 1_000_000;
+const VISION_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
+const VISION_MODELS = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.5-flash"];
+const VISION_KEY = "AQ.Ab8RN6J-3AVXdBiJyHl9owNma7eGBkhsUXaQ_j1fm0ypkMH10g";
+const MAX_BYTES = 4_000_000;
 const CLARITY_EDGE = 2200;
 const TARGET_EDGE = 3200;
 const BLUR_LIMIT = 80;
 
 type StatusListener = (status: string) => void;
 
-type OcrWordBox = {
-  WordText?: string;
-  Left?: number;
-  Top?: number;
-  Height?: number;
-  Width?: number;
+type VisionDay = {
+  day?: number;
+  raw?: string;
+  code?: string;
 };
 
-type OcrLine = { Words?: OcrWordBox[] };
-
-type ParsedPage = {
-  ParsedText?: string | null;
-  TextOverlay?: { Lines?: OcrLine[] } | null;
-  ErrorMessage?: string | string[] | null;
-  FileParseExitCode?: number | string;
+type VisionPayload = {
+  found?: boolean;
+  days?: VisionDay[];
 };
 
-type OcrResponse = {
-  ParsedResults?: ParsedPage[];
-  IsErroredOnProcessing?: boolean;
-  ErrorMessage?: string | string[] | null;
-  OCRExitCode?: number | string;
+type VisionResponse = {
+  candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  error?: { message?: string; status?: string };
 };
 
 export type PreparedPhoto = {
@@ -48,11 +42,6 @@ class QuotaError extends Error {
     super("quota");
     this.name = "QuotaError";
   }
-}
-
-function messageText(value: unknown): string {
-  if (Array.isArray(value)) return value.filter((item) => typeof item === "string").join(" ");
-  return typeof value === "string" ? value : "";
 }
 
 function quotaReached(text: string): boolean {
@@ -106,26 +95,12 @@ function isUnclear(bitmap: ImageBitmap): boolean {
 }
 
 function enhancePixels(image: ImageData): void {
-  const { data, width, height } = image;
-  const gray = new Uint8ClampedArray(width * height);
-  for (let index = 0, pixel = 0; index < data.length; index += 4, pixel += 1) {
-    const value = data[index] * 0.3 + data[index + 1] * 0.59 + data[index + 2] * 0.11;
-    gray[pixel] = Math.max(0, Math.min(255, (value - 128) * 1.45 + 128));
-  }
-  for (let y = 1; y < height - 1; y += 1) {
-    for (let x = 1; x < width - 1; x += 1) {
-      const index = y * width + x;
-      const sharp =
-        gray[index] * 5 -
-        gray[index - 1] -
-        gray[index + 1] -
-        gray[index - width] -
-        gray[index + width];
-      const value = Math.max(0, Math.min(255, sharp));
-      const offset = index * 4;
-      data[offset] = value;
-      data[offset + 1] = value;
-      data[offset + 2] = value;
+  const { data } = image;
+  const contrast = 1.2;
+  for (let index = 0; index < data.length; index += 4) {
+    for (let channel = 0; channel < 3; channel += 1) {
+      const value = data[index + channel];
+      data[index + channel] = Math.max(0, Math.min(255, (value - 128) * contrast + 128));
     }
   }
 }
@@ -182,69 +157,147 @@ export async function preparePhoto(file: File): Promise<PreparedPhoto> {
   }
 }
 
-function collect(page: ParsedPage): { words: OcrWord[]; lines: string[] } {
-  const words: OcrWord[] = [];
-  const lines: string[] = [];
-  for (const line of page.TextOverlay?.Lines ?? []) {
-    const parts: string[] = [];
-    for (const word of line.Words ?? []) {
-      const text = word.WordText?.trim() ?? "";
-      if (!text) continue;
-      const x0 = word.Left ?? 0;
-      const y0 = word.Top ?? 0;
-      words.push({
-        text,
-        x0,
-        y0,
-        x1: x0 + (word.Width ?? 0),
-        y1: y0 + (word.Height ?? 0),
-      });
-      parts.push(text);
-    }
-    if (parts.length > 0) lines.push(parts.join(" "));
-  }
-  const parsed = page.ParsedText?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) ?? [];
-  lines.push(...parsed);
-  return { words, lines };
+function missingRow(personName: string): Error {
+  return new Error(`找不到「${personName}」這一列，請拍清楚整張班表後再試`);
 }
 
-async function requestOcr(image: Blob): Promise<ParsedPage> {
-  const body = new FormData();
-  body.append("file", image, "roster.jpg");
-  body.append("language", "cht");
-  body.append("isOverlayRequired", "true");
-  body.append("scale", "true");
-  body.append("isTable", "true");
-  body.append("OCREngine", "3");
-  body.append("detectOrientation", "true");
-  let response: Response;
+function visionPrompt(personName: string, year: number, month: number, dayCount: number): string {
+  return [
+    "你正在看一張護理師紙本班表。請同時判斷文字內容、表格格線的位置，以及每一欄對應哪一天。不要把整張照片的文字依序抄下來。",
+    `目標是 ${year} 年 ${month} 月，這個月有 ${dayCount} 天。只讀姓名「${personName}」那一列。`,
+    `表頭有 1 到 ${dayCount}，從左到右各佔一欄。days 必須剛好 ${dayCount} 筆，day 從 1 到 ${dayCount} 各出現一次，而且 day 必須等於該欄表頭印的數字。`,
+    "先對齊表頭的日期數字，再讀這個姓名同一欄的格子。不要拿上一列或下一列的班，也不要因為旁邊格子字比較多就把內容往左或往右挪。",
+    "同一格裡上下兩行仍是同一天。08-12 在上、13-17 在下是課，不可以拆成兩天，也不可以因此跳過隔壁只寫例假的窄欄。",
+    "00-08 或 00~08 是 0-8，16-00 是 16-0，08-16 是 8-16。例假、休假、休息日、特別休假是 off。只寫例假的那一欄就是 off。",
+    `如果看不到「${personName}」，found 設為 false，days 留空，不要填其他人的班。`,
+    "raw 寫該格紙上的原文。code 只能是 課、off、0-8、16-0、8-16。",
+  ].join("\n");
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result ?? "");
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(new Error("無法處理照片"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function parseVision(text: string): VisionPayload | null {
+  const trimmed = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+  if (!trimmed) return null;
   try {
-    response = await fetch(OCR_ENDPOINT, {
-      method: "POST",
-      headers: { apikey: OCR_KEY },
-      body,
-    });
+    const payload = JSON.parse(trimmed) as VisionPayload;
+    if (!payload || typeof payload !== "object") return null;
+    return payload;
   } catch {
-    throw new Error("沒有網路，請連線後再試");
+    return null;
   }
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
+}
+
+export function scheduleFromVision(payload: VisionPayload, personName: string, year: number, month: number): MonthSchedule {
+  if (!payload.found) throw missingRow(personName);
+  const dayCount = daysInMonth(year, month);
+  const days: Record<number, DayShift> = {};
+  for (const item of payload.days ?? []) {
+    const day = Number(item.day);
+    if (!Number.isInteger(day) || day < 1 || day > dayCount || days[day]) continue;
+    const raw = typeof item.raw === "string" ? item.raw.trim() : "";
+    const modelCode = typeof item.code === "string" ? item.code.trim() : "";
+    const code = coerceShift(raw, modelCode);
+    if (code === "unknown" && !raw && !modelCode) continue;
+    days[day] = { code, raw: raw || modelCode };
+  }
+  if (!Object.values(days).some((shift) => shift.code !== "unknown")) throw missingRow(personName);
+  return {
+    year,
+    month,
+    personName,
+    days,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function requestVision(image: Blob, personName: string, year: number, month: number, dayCount: number): Promise<VisionPayload> {
+  if (!VISION_KEY) throw new Error("視覺辨識金鑰尚未設定");
+  const data = await blobToBase64(image);
+  const body = JSON.stringify({
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { inlineData: { mimeType: image.type || "image/jpeg", data } },
+          { text: visionPrompt(personName, year, month, dayCount) },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0,
+      thinkingConfig: { thinkingBudget: 0 },
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          found: { type: "BOOLEAN" },
+          days: {
+            type: "ARRAY",
+            items: {
+              type: "OBJECT",
+              properties: {
+                day: { type: "INTEGER" },
+                raw: { type: "STRING" },
+                code: { type: "STRING" },
+              },
+              required: ["day", "raw", "code"],
+            },
+          },
+        },
+        required: ["found", "days"],
+      },
+    },
+  });
+  let sawMissingModel = false;
+  for (const model of VISION_MODELS) {
+    let response: Response;
+    try {
+      response = await fetch(`${VISION_ENDPOINT}/${model}:generateContent`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": VISION_KEY,
+        },
+        body,
+        signal: AbortSignal.timeout(90_000),
+      });
+    } catch (error) {
+      const name = error instanceof Error ? error.name : "";
+      if (name === "TimeoutError" || name === "AbortError") continue;
+      throw new Error("沒有網路，請連線後再試");
+    }
+    const detail = await response.text();
+    if (response.status === 404 || response.status === 503) {
+      sawMissingModel = true;
+      continue;
+    }
     if (response.status === 429 || quotaReached(detail)) throw new QuotaError();
-    throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
+    if (!response.ok) throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
+    let payload: VisionResponse;
+    try {
+      payload = JSON.parse(detail) as VisionResponse;
+    } catch {
+      throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
+    }
+    const text = payload.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
+    const parsed = parseVision(text);
+    if (!parsed) throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
+    return parsed;
   }
-  const payload = (await response.json()) as OcrResponse;
-  const error = messageText(payload.ErrorMessage);
-  if (payload.IsErroredOnProcessing || payload.OCRExitCode === 3 || payload.OCRExitCode === "3") {
-    if (quotaReached(error)) throw new QuotaError();
-    throw new Error(error || "這張照片沒有辨識成功，請再拍清楚一點");
-  }
-  const page = payload.ParsedResults?.[0];
-  if (!page || page.FileParseExitCode === -10 || page.FileParseExitCode === "-10") {
-    const pageError = messageText(page?.ErrorMessage);
-    if (quotaReached(pageError)) throw new QuotaError();
-    throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
-  }
-  return page;
+  if (sawMissingModel) throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
+  throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
 }
 
 let workerPromise: Promise<Worker> | null = null;
@@ -324,16 +377,6 @@ export async function readLocalRow(
   };
 }
 
-function scheduleFrom(found: { days: MonthSchedule["days"] }, personName: string, year: number, month: number): MonthSchedule {
-  return {
-    year,
-    month,
-    personName,
-    days: found.days,
-    updatedAt: new Date().toISOString(),
-  };
-}
-
 export async function readPersonRow(
   file: File,
   personName: string,
@@ -354,14 +397,11 @@ export async function readPersonRow(
   }
   onStatus("正在上傳班表…");
   try {
-    const page = await requestOcr(prepared.upload);
-    const { words, lines } = collect(page);
-    const found = extractRow(words, trimmedName, daysInMonth(year, month), lines);
-    if (!found.found) throw new Error(`找不到「${trimmedName}」這一列，請拍清楚整張班表後再試`);
-    return scheduleFrom(found, trimmedName, year, month);
+    const payload = await requestVision(prepared.upload, trimmedName, year, month, daysInMonth(year, month));
+    return scheduleFromVision(payload, trimmedName, year, month);
   } catch (error) {
     if (!(error instanceof QuotaError)) throw error;
-    onStatus("免費次數已用完，改在手機裡辨識…");
+    onStatus("免費視覺辨識次數已用完，改在這台裝置上辨識…");
     return readLocalRow(prepared.canvas, trimmedName, year, month);
   }
 }
