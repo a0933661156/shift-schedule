@@ -5,9 +5,10 @@ import { extractRow, type OcrWord } from "./row.ts";
 import { coerceShift } from "./shifts.ts";
 import type { DayShift, MonthSchedule } from "../types.ts";
 
-const VISION_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
-const VISION_MODELS = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.5-flash"];
-const VISION_KEY = "AQ.Ab8RN6J-3AVXdBiJyHl9owNma7eGBkhsUXaQ_j1fm0ypkMH10g";
+const VISION_ENDPOINT = "https://api.openai.com/v1/chat/completions";
+const VISION_MODELS = ["gpt-5.4", "gpt-4.1-mini"];
+const VISION_KEY =
+  "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";
 const MAX_BYTES = 4_000_000;
 const CLARITY_EDGE = 2200;
 const TARGET_EDGE = 3200;
@@ -27,8 +28,8 @@ type VisionPayload = {
 };
 
 type VisionResponse = {
-  candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-  error?: { message?: string; status?: string };
+  choices?: Array<{ message?: { content?: string | null } }>;
+  error?: { message?: string; code?: string; type?: string };
 };
 
 export type PreparedPhoto = {
@@ -62,6 +63,7 @@ export type ReadResult = {
 function sanitizeApiText(text: string): string {
   return text
     .replace(/AQ\.[A-Za-z0-9_-]+/g, "")
+    .replace(/sk-[A-Za-z0-9_-]+/g, "")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 140);
@@ -78,23 +80,23 @@ function apiErrorText(detail: string): string {
 
 function quotaReached(status: number, detail: string): boolean {
   if (status === 429) return true;
-  return /RESOURCE_EXHAUSTED|quota|rate limit|too many requests/i.test(detail);
+  return /insufficient_quota|billing_hard_limit_reached|quota|rate limit|too many requests/i.test(detail);
 }
 
 function visionFailureMessage(problem: VisionProblem, status: number, detail: string): string {
   const reason = apiErrorText(detail);
-  if (problem === "timeout") return "Gemini 等候超過 90 秒，沒有辨識完成。請稍後再試。";
-  if (problem === "unavailable") return "Gemini 目前使用人數較多，暫時沒有辨識成功。請稍後再試。";
-  if (problem === "missing") return "目前的 Gemini 模型無法使用。請稍後再試。";
-  if (problem === "parse") return "Gemini 有回覆，但內容無法整理成班表。請再拍一張包含完整表格、姓名清楚的照片。";
+  if (problem === "timeout") return "GPT 等候超過 90 秒，沒有辨識完成。請稍後再試。";
+  if (problem === "unavailable") return "GPT 目前使用人數較多，暫時沒有辨識成功。請稍後再試。";
+  if (problem === "missing") return "目前的 GPT 模型無法使用。請稍後再試。";
+  if (problem === "parse") return "GPT 有回覆，但內容無法整理成班表。請再拍一張包含完整表格、姓名清楚的照片。";
   if (status === 401 || status === 403) {
     return reason ? `視覺辨識金鑰無法使用（${status}）。${reason}` : `視覺辨識金鑰無法使用（${status}）。`;
   }
   if (status === 400) {
-    return reason ? `Gemini 無法處理這張照片（400）。${reason}` : "Gemini 無法處理這張照片（400）。請改拍一張較清楚的 JPEG。";
+    return reason ? `GPT 無法處理這張照片（400）。${reason}` : "GPT 無法處理這張照片（400）。請改拍一張較清楚的 JPEG。";
   }
-  if (status >= 500) return `Gemini 服務暫時出錯（${status}）。請稍後再試。`;
-  return reason ? `Gemini 沒有辨識成功（${status || "未知"}）。${reason}` : `Gemini 沒有辨識成功（${status || "未知"}）。`;
+  if (status >= 500) return `GPT 服務暫時出錯（${status}）。請稍後再試。`;
+  return reason ? `GPT 沒有辨識成功（${status || "未知"}）。${reason}` : `GPT 沒有辨識成功（${status || "未知"}）。`;
 }
 
 class VisionFailure extends Error {
@@ -281,44 +283,56 @@ export function scheduleFromVision(payload: VisionPayload, personName: string, y
   };
 }
 
-async function requestVision(image: Blob, personName: string, year: number, month: number, dayCount: number): Promise<VisionPayload> {
-  if (!VISION_KEY) throw new Error("視覺辨識金鑰尚未設定");
-  const data = await blobToBase64(image);
-  const body = JSON.stringify({
-    contents: [
+function visionBody(model: string, mime: string, data: string, prompt: string): string {
+  return JSON.stringify({
+    model,
+    max_completion_tokens: 4096,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "roster_row",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            found: { type: "boolean" },
+            note: { type: "string" },
+            days: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  day: { type: "integer" },
+                  raw: { type: "string" },
+                  code: { type: "string", enum: ["課", "off", "0-8", "16-0", "8-16"] },
+                },
+                required: ["day", "raw", "code"],
+              },
+            },
+          },
+          required: ["found", "note", "days"],
+        },
+      },
+    },
+    messages: [
       {
         role: "user",
-        parts: [
-          { inlineData: { mimeType: image.type || "image/jpeg", data } },
-          { text: visionPrompt(personName, year, month, dayCount) },
+        content: [
+          { type: "text", text: prompt },
+          { type: "image_url", image_url: { url: `data:${mime};base64,${data}`, detail: "high" } },
         ],
       },
     ],
-    generationConfig: {
-      temperature: 0,
-      thinkingConfig: { thinkingBudget: 0 },
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: "OBJECT",
-        properties: {
-          found: { type: "BOOLEAN" },
-          days: {
-            type: "ARRAY",
-            items: {
-              type: "OBJECT",
-              properties: {
-                day: { type: "INTEGER" },
-                raw: { type: "STRING" },
-                code: { type: "STRING" },
-              },
-              required: ["day", "raw", "code"],
-            },
-          },
-        },
-        required: ["found", "days"],
-      },
-    },
   });
+}
+
+async function requestVision(image: Blob, personName: string, year: number, month: number, dayCount: number): Promise<VisionPayload> {
+  if (!VISION_KEY) throw new Error("視覺辨識金鑰尚未設定");
+  const data = await blobToBase64(image);
+  const mime = image.type || "image/jpeg";
+  const prompt = visionPrompt(personName, year, month, dayCount);
   let worst: VisionFailure | null = null;
   const remember = (problem: VisionProblem, status = 0, detail = "") => {
     const next = new VisionFailure(problem, status, detail);
@@ -327,13 +341,13 @@ async function requestVision(image: Blob, personName: string, year: number, mont
   for (const model of VISION_MODELS) {
     let response: Response;
     try {
-      response = await fetch(`${VISION_ENDPOINT}/${model}:generateContent`, {
+      response = await fetch(VISION_ENDPOINT, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-goog-api-key": VISION_KEY,
+          Authorization: `Bearer ${VISION_KEY}`,
         },
-        body,
+        body: visionBody(model, mime, data, prompt),
         signal: AbortSignal.timeout(90_000),
       });
     } catch (error) {
@@ -342,7 +356,7 @@ async function requestVision(image: Blob, personName: string, year: number, mont
         remember("timeout");
         continue;
       }
-      throw new Error("沒有網路，無法連上 Gemini。請連線後再試。");
+      throw new Error("沒有網路，無法連上 GPT。請連線後再試。");
     }
     const detail = await response.text();
     if (response.status === 404) {
@@ -366,7 +380,7 @@ async function requestVision(image: Blob, personName: string, year: number, mont
       remember("parse");
       continue;
     }
-    const text = payload.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
+    const text = payload.choices?.[0]?.message?.content ?? "";
     const parsed = parseVision(text);
     if (!parsed) {
       remember("parse");
@@ -472,19 +486,19 @@ export async function readPersonRow(
   } catch {
     throw new Error("無法讀取這張照片");
   }
-  onStatus("正在上傳給 Gemini 辨識…");
+  onStatus("正在上傳給 GPT 辨識…");
   try {
     const payload = await requestVision(prepared.upload, trimmedName, year, month, daysInMonth(year, month));
     return { schedule: scheduleFromVision(payload, trimmedName, year, month), notice: null };
   } catch (error) {
     if (!(error instanceof QuotaError)) throw error;
-    onStatus("免費視覺辨識次數已用完，改在這台裝置上辨識…");
+    onStatus("GPT 辨識額度已用完，改在這台裝置上辨識…");
     try {
       const schedule = await readLocalRow(prepared.canvas, trimmedName, year, month);
-      return { schedule, notice: "免費視覺辨識次數已用完，這次改由這台裝置辨識。請再核對班表。" };
+      return { schedule, notice: "GPT 辨識額度已用完，這次改由這台裝置辨識。請再核對班表。" };
     } catch (localError) {
       const reason = localError instanceof Error ? localError.message : "沒有辨識成功";
-      throw new Error(`免費視覺辨識次數已用完。改在這台裝置上辨識也失敗：${reason}`);
+      throw new Error(`GPT 辨識額度已用完。改在這台裝置上辨識也失敗：${reason}`);
     }
   }
 }

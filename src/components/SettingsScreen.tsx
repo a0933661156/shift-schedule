@@ -28,7 +28,7 @@ export function SettingsScreen({ settings, year, month, hasSchedule, message, on
         <input value={personName} onChange={(event) => setPersonName(event.target.value)} />
       </label>
       <p className="field-hint">
-        拍照時可以包含其他人。照片會上傳到 Gemini 看表格，只取出這個姓名那一列。免費次數用完時，會改在這台裝置上辨識，照片不會再上傳。
+        拍照時可以包含其他人。照片會上傳到 GPT 看表格，只取出這個姓名那一列。辨識額度用完時，會改在這台裝置上辨識，照片不會再上傳。
       </p>
       <button type="button" className="danger" disabled={!hasSchedule} onClick={onClear}>
         清除 {year}年{month}月班表
