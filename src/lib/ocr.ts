@@ -44,8 +44,67 @@ class QuotaError extends Error {
   }
 }
 
-function quotaReached(text: string): boolean {
-  return /limit|quota|maximum|too many/i.test(text);
+type VisionProblem = "timeout" | "unavailable" | "missing" | "parse" | "http";
+
+const PROBLEM_RANK: Record<VisionProblem, number> = {
+  timeout: 1,
+  missing: 2,
+  unavailable: 3,
+  parse: 4,
+  http: 5,
+};
+
+export type ReadResult = {
+  schedule: MonthSchedule;
+  notice: string | null;
+};
+
+function sanitizeApiText(text: string): string {
+  return text
+    .replace(/AQ\.[A-Za-z0-9_-]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 140);
+}
+
+function apiErrorText(detail: string): string {
+  try {
+    const payload = JSON.parse(detail) as VisionResponse;
+    return sanitizeApiText(payload.error?.message ?? "");
+  } catch {
+    return sanitizeApiText(detail);
+  }
+}
+
+function quotaReached(status: number, detail: string): boolean {
+  if (status === 429) return true;
+  return /RESOURCE_EXHAUSTED|quota|rate limit|too many requests/i.test(detail);
+}
+
+function visionFailureMessage(problem: VisionProblem, status: number, detail: string): string {
+  const reason = apiErrorText(detail);
+  if (problem === "timeout") return "Gemini 等候超過 90 秒，沒有辨識完成。請稍後再試。";
+  if (problem === "unavailable") return "Gemini 目前使用人數較多，暫時沒有辨識成功。請稍後再試。";
+  if (problem === "missing") return "目前的 Gemini 模型無法使用。請稍後再試。";
+  if (problem === "parse") return "Gemini 有回覆，但內容無法整理成班表。請再拍一張包含完整表格、姓名清楚的照片。";
+  if (status === 401 || status === 403) {
+    return reason ? `視覺辨識金鑰無法使用（${status}）。${reason}` : `視覺辨識金鑰無法使用（${status}）。`;
+  }
+  if (status === 400) {
+    return reason ? `Gemini 無法處理這張照片（400）。${reason}` : "Gemini 無法處理這張照片（400）。請改拍一張較清楚的 JPEG。";
+  }
+  if (status >= 500) return `Gemini 服務暫時出錯（${status}）。請稍後再試。`;
+  return reason ? `Gemini 沒有辨識成功（${status || "未知"}）。${reason}` : `Gemini 沒有辨識成功（${status || "未知"}）。`;
+}
+
+class VisionFailure extends Error {
+  readonly problem: VisionProblem;
+
+  constructor(problem: VisionProblem, status = 0, detail = "") {
+    super(visionFailureMessage(problem, status, detail));
+    this.name = "VisionFailure";
+    this.problem = problem;
+  }
 }
 
 function laplacianVariance(image: ImageData): number {
@@ -260,7 +319,11 @@ async function requestVision(image: Blob, personName: string, year: number, mont
       },
     },
   });
-  let sawMissingModel = false;
+  let worst: VisionFailure | null = null;
+  const remember = (problem: VisionProblem, status = 0, detail = "") => {
+    const next = new VisionFailure(problem, status, detail);
+    if (!worst || PROBLEM_RANK[next.problem] >= PROBLEM_RANK[worst.problem]) worst = next;
+  };
   for (const model of VISION_MODELS) {
     let response: Response;
     try {
@@ -275,29 +338,43 @@ async function requestVision(image: Blob, personName: string, year: number, mont
       });
     } catch (error) {
       const name = error instanceof Error ? error.name : "";
-      if (name === "TimeoutError" || name === "AbortError") continue;
-      throw new Error("沒有網路，請連線後再試");
+      if (name === "TimeoutError" || name === "AbortError") {
+        remember("timeout");
+        continue;
+      }
+      throw new Error("沒有網路，無法連上 Gemini。請連線後再試。");
     }
     const detail = await response.text();
-    if (response.status === 404 || response.status === 503) {
-      sawMissingModel = true;
+    if (response.status === 404) {
+      remember("missing", response.status, detail);
       continue;
     }
-    if (response.status === 429 || quotaReached(detail)) throw new QuotaError();
-    if (!response.ok) throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
+    if (response.status === 503) {
+      remember("unavailable", response.status, detail);
+      continue;
+    }
+    if (quotaReached(response.status, detail)) throw new QuotaError();
+    if (response.status === 401 || response.status === 403) throw new VisionFailure("http", response.status, detail);
+    if (!response.ok) {
+      remember("http", response.status, detail);
+      continue;
+    }
     let payload: VisionResponse;
     try {
       payload = JSON.parse(detail) as VisionResponse;
     } catch {
-      throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
+      remember("parse");
+      continue;
     }
     const text = payload.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
     const parsed = parseVision(text);
-    if (!parsed) throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
+    if (!parsed) {
+      remember("parse");
+      continue;
+    }
     return parsed;
   }
-  if (sawMissingModel) throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
-  throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
+  throw worst ?? new VisionFailure("http");
 }
 
 let workerPromise: Promise<Worker> | null = null;
@@ -365,9 +442,9 @@ export async function readLocalRow(
       found = extractRow(blockCollected.words, trimmedName, dayCount, [...sparseCollected.lines, ...blockCollected.lines]);
     }
   } catch {
-    throw new Error("這張照片沒有辨識成功，請再拍清楚一點");
+    throw new Error("這台裝置上的文字辨識沒有讀出表格");
   }
-  if (!found.found) throw new Error(`找不到「${trimmedName}」這一列，請拍清楚整張班表後再試`);
+  if (!found.found) throw new Error(`找不到「${trimmedName}」這一列`);
   return {
     year,
     month,
@@ -383,7 +460,7 @@ export async function readPersonRow(
   year: number,
   month: number,
   onStatus: StatusListener = () => undefined,
-): Promise<MonthSchedule> {
+): Promise<ReadResult> {
   const trimmedName = personName.trim() || "常怡然";
   let prepared: PreparedPhoto;
   try {
@@ -395,13 +472,19 @@ export async function readPersonRow(
   } catch {
     throw new Error("無法讀取這張照片");
   }
-  onStatus("正在上傳班表…");
+  onStatus("正在上傳給 Gemini 辨識…");
   try {
     const payload = await requestVision(prepared.upload, trimmedName, year, month, daysInMonth(year, month));
-    return scheduleFromVision(payload, trimmedName, year, month);
+    return { schedule: scheduleFromVision(payload, trimmedName, year, month), notice: null };
   } catch (error) {
     if (!(error instanceof QuotaError)) throw error;
     onStatus("免費視覺辨識次數已用完，改在這台裝置上辨識…");
-    return readLocalRow(prepared.canvas, trimmedName, year, month);
+    try {
+      const schedule = await readLocalRow(prepared.canvas, trimmedName, year, month);
+      return { schedule, notice: "免費視覺辨識次數已用完，這次改由這台裝置辨識。請再核對班表。" };
+    } catch (localError) {
+      const reason = localError instanceof Error ? localError.message : "沒有辨識成功";
+      throw new Error(`免費視覺辨識次數已用完。改在這台裝置上辨識也失敗：${reason}`);
+    }
   }
 }

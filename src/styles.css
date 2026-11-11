@@ -291,6 +291,7 @@ button {
 .banner {
   background: #fff4e8;
   color: #8a3b00;
+  line-height: 1.5;
 }
 
 .banner.ok {

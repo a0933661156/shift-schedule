@@ -102,11 +102,12 @@ export default function App() {
     setBusyLabel("正在讀取班表…");
     setMessage(null);
     try {
-      const next = await readPersonRow(file, settings.personName, cursor.year, cursor.month, setBusyLabel);
-      setDraft(next);
-      setSelectedDay(initialSelection(next.year, next.month) ?? 1);
+      const result = await readPersonRow(file, settings.personName, cursor.year, cursor.month, setBusyLabel);
+      setDraft(result.schedule);
+      setSelectedDay(initialSelection(result.schedule.year, result.schedule.month) ?? 1);
       setView("review");
-      if (Object.keys(next.days).length === 0) setMessage("沒有讀到任何班別，請重新拍照或手動填寫。");
+      if (result.notice) setMessage(result.notice);
+      else if (Object.keys(result.schedule.days).length === 0) setMessage("沒有讀到任何班別，請重新拍照或手動填寫。");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "讀取班表失敗");
     } finally {
