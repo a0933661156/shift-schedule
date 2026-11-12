@@ -470,6 +470,30 @@ button {
   color: #2457f5;
 }
 
+.guide h2 {
+  margin: 8px 0 0;
+  font-size: 18px;
+}
+
+.guide p,
+.guide li {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+.guide ol {
+  margin: 0;
+  padding-left: 1.3em;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.guide a {
+  color: #2457f5;
+}
+
 .legend-row {
   display: flex;
   justify-content: center;

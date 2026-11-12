@@ -10,15 +10,19 @@ type SettingsScreenProps = {
   message: string | null;
   onSave: (settings: Settings) => void;
   onClear: () => void;
+  onOpenGuide: () => void;
 };
 
-export function SettingsScreen({ settings, year, month, hasSchedule, message, onSave, onClear }: SettingsScreenProps) {
+export function SettingsScreen({ settings, year, month, hasSchedule, message, onSave, onClear, onOpenGuide }: SettingsScreenProps) {
   const [personName, setPersonName] = useState(settings.personName);
   const [accessPassword, setAccessPassword] = useState(settings.accessPassword);
 
   return (
     <section className="settings">
       <h1>設定</h1>
+      <button type="button" onClick={onOpenGuide}>
+        使用說明
+      </button>
       {message ? (
         <p className="banner" role="status">
           {message}

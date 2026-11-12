@@ -1,6 +1,7 @@
 import { useRef, useState, type ChangeEvent } from "react";
 import { MonthCalendar } from "./components/MonthCalendar.tsx";
 import { HangingPlaques, MonthScene } from "./components/MonthScene.tsx";
+import { GuideScreen } from "./components/GuideScreen.tsx";
 import { SettingsScreen } from "./components/SettingsScreen.tsx";
 import { ShiftPicker } from "./components/ShiftPicker.tsx";
 import { addMonths, daysInMonth } from "./lib/calendar.ts";
@@ -8,7 +9,7 @@ import { readPersonRow } from "./lib/ocr.ts";
 import { clearSchedule, loadSchedule, loadSettings, saveSchedule, saveSettings, withDay } from "./lib/storage.ts";
 import type { MonthSchedule, Settings, ShiftCode } from "./types.ts";
 
-type View = "calendar" | "review" | "settings";
+type View = "calendar" | "review" | "settings" | "guide";
 
 function currentMonth(): { year: number; month: number } {
   const now = new Date();
@@ -186,7 +187,10 @@ export default function App() {
           message={message}
           onSave={saveSettingsAndClose}
           onClear={clearViewedMonth}
+          onOpenGuide={() => setView("guide")}
         />
+      ) : view === "guide" ? (
+        <GuideScreen onBack={() => setView("settings")} />
       ) : (
         <>
           <header className="top">
