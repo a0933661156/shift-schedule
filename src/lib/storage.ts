@@ -5,6 +5,7 @@ const SETTINGS_KEY = "nursing-schedule:settings";
 
 export const DEFAULT_SETTINGS: Settings = {
   personName: "常怡然",
+  accessPassword: "",
 };
 
 export function loadSettings(): Settings {
@@ -17,6 +18,7 @@ export function loadSettings(): Settings {
         typeof parsed.personName === "string" && parsed.personName.trim()
           ? parsed.personName.trim()
           : DEFAULT_SETTINGS.personName,
+      accessPassword: typeof parsed.accessPassword === "string" ? parsed.accessPassword : "",
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -26,6 +28,7 @@ export function loadSettings(): Settings {
 export function saveSettings(settings: Settings): void {
   const next: Settings = {
     personName: settings.personName.trim() || DEFAULT_SETTINGS.personName,
+    accessPassword: settings.accessPassword.trim(),
   };
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
 }

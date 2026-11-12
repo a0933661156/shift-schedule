@@ -5,10 +5,8 @@ import { extractRow, type OcrWord } from "./row.ts";
 import { coerceShift } from "./shifts.ts";
 import type { DayShift, MonthSchedule } from "../types.ts";
 
-const VISION_ENDPOINT = "https://api.openai.com/v1/chat/completions";
+const VISION_ENDPOINT = "https://nursing-schedule-vision.nursing-shift.workers.dev";
 const VISION_MODELS = ["gpt-5.4", "gpt-4.1-mini"];
-const VISION_KEY =
-  "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";
 const MAX_BYTES = 4_000_000;
 const CLARITY_EDGE = 2200;
 const TARGET_EDGE = 3200;
@@ -328,8 +326,14 @@ function visionBody(model: string, mime: string, data: string, prompt: string): 
   });
 }
 
-async function requestVision(image: Blob, personName: string, year: number, month: number, dayCount: number): Promise<VisionPayload> {
-  if (!VISION_KEY) throw new Error("視覺辨識金鑰尚未設定");
+async function requestVision(
+  image: Blob,
+  password: string,
+  personName: string,
+  year: number,
+  month: number,
+  dayCount: number,
+): Promise<VisionPayload> {
   const data = await blobToBase64(image);
   const mime = image.type || "image/jpeg";
   const prompt = visionPrompt(personName, year, month, dayCount);
@@ -345,7 +349,7 @@ async function requestVision(image: Blob, personName: string, year: number, mont
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${VISION_KEY}`,
+          "x-schedule-password": password,
         },
         body: visionBody(model, mime, data, prompt),
         signal: AbortSignal.timeout(90_000),
@@ -356,7 +360,7 @@ async function requestVision(image: Blob, personName: string, year: number, mont
         remember("timeout");
         continue;
       }
-      throw new Error("沒有網路，無法連上 GPT。請連線後再試。");
+      throw new Error("無法連上辨識服務。請確認網路後再試。");
     }
     const detail = await response.text();
     if (response.status === 404) {
@@ -368,7 +372,11 @@ async function requestVision(image: Blob, personName: string, year: number, mont
       continue;
     }
     if (quotaReached(response.status, detail)) throw new QuotaError();
-    if (response.status === 401 || response.status === 403) throw new VisionFailure("http", response.status, detail);
+    if (response.status === 401 || response.status === 403) {
+      const reason = apiErrorText(detail);
+      if (reason.includes("辨識密碼")) throw new Error(reason);
+      throw new VisionFailure("http", response.status, detail);
+    }
     if (!response.ok) {
       remember("http", response.status, detail);
       continue;
@@ -473,8 +481,11 @@ export async function readPersonRow(
   personName: string,
   year: number,
   month: number,
+  password: string,
   onStatus: StatusListener = () => undefined,
 ): Promise<ReadResult> {
+  const gate = password.trim();
+  if (!gate) throw new Error("請先到設定填寫辨識密碼");
   const trimmedName = personName.trim() || "常怡然";
   let prepared: PreparedPhoto;
   try {
@@ -488,7 +499,7 @@ export async function readPersonRow(
   }
   onStatus("正在上傳給 GPT 辨識…");
   try {
-    const payload = await requestVision(prepared.upload, trimmedName, year, month, daysInMonth(year, month));
+    const payload = await requestVision(prepared.upload, gate, trimmedName, year, month, daysInMonth(year, month));
     return { schedule: scheduleFromVision(payload, trimmedName, year, month), notice: null };
   } catch (error) {
     if (!(error instanceof QuotaError)) throw error;

@@ -102,7 +102,14 @@ export default function App() {
     setBusyLabel("正在讀取班表…");
     setMessage(null);
     try {
-      const result = await readPersonRow(file, settings.personName, cursor.year, cursor.month, setBusyLabel);
+      const result = await readPersonRow(
+        file,
+        settings.personName,
+        cursor.year,
+        cursor.month,
+        settings.accessPassword,
+        setBusyLabel,
+      );
       setDraft(result.schedule);
       setSelectedDay(initialSelection(result.schedule.year, result.schedule.month) ?? 1);
       setView("review");

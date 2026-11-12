@@ -19,4 +19,5 @@ export type MonthSchedule = {
 
 export type Settings = {
   personName: string;
+  accessPassword: string;
 };
